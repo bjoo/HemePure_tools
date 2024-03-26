@@ -17,94 +17,522 @@
 #include <algorithm>
 
 #include "raw_data_reader.hpp"
+#include "gmy.h"
+#include <rpc/rpc.h>
+#include <zlib.h>
 
 // This will be my map of blocks to file offsets. 
 
 constexpr uint64_t blockDim = 8;
 constexpr uint64_t blockSites = (blockDim*blockDim*blockDim);
-struct RemoteEntry {
-  int dest_rank;
-  std::vector<uint64_t*> sites;
-};
+
+
 
 // The block map is a map from block id to to a vector
 // the vector stores pairs of (site_id, offset in local array)
-std::map< uint64_t, std::vector< uint64_t* > > local_blocksite_map;
-std::unordered_map< uint64_t, RemoteEntry >  remote_blocksite_map;
 
+uint64_t nBlocksX = 0;
+uint64_t nBlocksY = 0;
+uint64_t nBlocksZ = 0;
+int this_rank=0;
+int num_ranks=0;
+std::vector<Site> rearranged_data;
 
-#if 0
-void packBlockLocation( uint64_t block_id, uint64_t this_rank,
-						const BlockLocation& bl, 
-						std::vector< uint64_t >::iterator& bufit )
+struct ConvertedBlockInfo { 
+	std::array<Site*,blockSites> sites;	
+	NonEmptyHeaderRecord header;
+	ConvertedBlockInfo() {
+		for(int i=0; i < blockSites; i++) sites[i]=nullptr;
+	} 
+};
+
+std::map<size_t, ConvertedBlockInfo> output_info;
+std::vector<char> outbuf;		// Output buffer
+
+void convertData(const std::string& output_filename)
 {
-	// Block ID
-	*bufit = block_id; bufit++;
+	double outinfo_starttime = MPI_Wtime();
+	// First set up a map of converted blockinfo 
+	for(int i=0; i < rearranged_data.size(); i++) {
+		Site* current_site = &rearranged_data[i];
 
-	// Rank
-	*bufit = static_cast<uint64_t>(this_rank); bufit++;
+		uint64_t x=current_site->x;
+		uint64_t y=current_site->y;
+		uint64_t z=current_site->z;
+		uint64_t blockX = x/ blockDim;
+		uint64_t blockY = y/ blockDim;
+		uint64_t blockZ = z/ blockDim;
+		uint64_t siteX = x % blockDim;
+		uint64_t siteY = y % blockDim;
+		uint64_t siteZ = z % blockDim;
+		uint64_t block_id = blockZ + nBlocksZ * (blockY + nBlocksY * blockX);
+		uint64_t site_id = siteZ + blockDim * (siteY + blockDim * siteX);
 
-	// Record n_fluid sites
-	*bufit = static_cast<uint64_t>(bl.site_offsets.size()); bufit++;
+		// If we have no block in our map	
+		// Insert an empty vector
+		if( output_info.find( block_id ) == output_info.end() ) {
+			ConvertedBlockInfo binfo;
+			binfo.header.sites = 0;
+			output_info.insert( std::pair<uint64_t, ConvertedBlockInfo >( block_id, binfo) );
+		}
 
-	// now go through and record the sites
-	for(const auto& p : bl.site_offsets ) {	
+		// We can fill the number of sites
+		ConvertedBlockInfo& binfo = output_info.at(block_id);
+		std::array<Site*,blockSites>& sites = binfo.sites;
+
+		// Everything will be null except the site we are adding
+		sites[site_id] = current_site ; // Pointer assignment
+		binfo.header.sites++; // Increase the site count for this block
+		binfo.header.blockNumber = block_id; // Insert the block number 
+	}
+
+	// Go through all the blocks and sum all the output sites
+	uint64_t total_output_sites = 0;
+	for( auto& kv : output_info ){
+
+		// Get the block id
+		uint64_t block_id = kv.first;
+
+		// look up the info for the block
+		ConvertedBlockInfo& binfo = output_info.at(block_id);
+
+		// Get the array of site pointers for the block
+		std::array<Site*,blockSites>& the_vec = output_info.at(block_id).sites;
+
+		// Add them to the total site count	
+		total_output_sites += binfo.header.sites;
+	}
+	
+	uint64_t total_sites;
+	MPI_Allreduce(&total_output_sites, &total_sites, 1, MPI_UINT64_T,MPI_SUM, MPI_COMM_WORLD);
+	double outinfo_endtime = MPI_Wtime();
+	if ( this_rank == 0 ) {
+		std::cout << "After rebinning: The total number of sites is: " << total_sites
+	 			  << " Rebinning took " << outinfo_endtime - outinfo_starttime <<  " sec. \n";
+	    std::cout << "Starting conversion and compression: \n";
+	}
+	double convert_starttime= MPI_Wtime();
+
+
+	// Now we want to set up buffers for output
+	size_t outbuf_idx = 0;
+	
+	// I am not sure I understand this calculation. My calculation would be:
+    //  uint32 - siteIsSimulated 
+    //  uint32 - hasWallNormal 
+    //  3xfloat - for wall normals 
+    //  26* [ uint32_t, uint32, float ] -- 26*[ linkType, configID, wallDistance ]
+	//
+	// so 5 x 32bit + 26 x 3 x 32 bit
+	// If I wanted to pad on a 64 bit boundary I would choose:
+	//  6 x 32bit + 26 x 4 x 32 bit => 4 (32 bit) x [ 6 + 26x4 ] = 440 bytes
+	// 
+	// uint64_t max_site_size = (2 + 26 * 4 * sizeof(uint64_t));
+	uint64_t max_site_size = 440;
+	uint64_t max_buffer_size = blockSites * max_site_size;
+	
+	std::vector<char> outputBuffer( total_output_sites * max_site_size );
+
+	// Now fill the buffer: Traverse the blocks, get the uncompressedSize
+	for( auto& kv : output_info ) {
+		uint64_t block_id = kv.first;	
+		ConvertedBlockInfo& binfo =  output_info.at(block_id);
+		binfo.header.fileOffset = outbuf_idx; // we will need to add the length of the header block to this
+
+		std::array<Site*,blockSites>& the_sites = binfo.sites; // The sites for my block
+		std::array<OutputSite*, blockSites> conv_sites;        // The converted sites
+
+		// For now we set all the converted sites to bet the null pointer
+		for(int i=0; i < blockSites; i++) conv_sites[i]=nullptr;
+
+		// We will need to store the temporary converted sites
+		std::vector<OutputSite> converted; 
+
+		// Travers all the sites
+		for(int i=0; i < blockSites; i++) {
+			Site* site_ptr = the_sites[i];
+
+			// If the site is a fluid site site_ptr is not null
+			if( site_ptr ) {
+				OutputSite newsite;
+				newsite.hasWallNormal = false;
+				newsite.normalX = 0.0;
+				newsite.normalY = 0.0;
+				newsite.normalZ = 0.0;
+				uint32_t num_intersections = 0;
+
+				newsite.x = site_ptr->x;
+				newsite.y = site_ptr->y;
+				newsite.z = site_ptr->z;
+
+				const std::array< std::array< uint64_t, 6>, 26>& ldata = site_ptr-> link_data;
+				for(int linkdir = 0; linkdir < 26; linkdir++) { 
+					const std::array< uint64_t, 6>& dir_ldata = ldata[linkdir];
+					uint64_t lu_wallDistance, lu_normalX, lu_normalY, lu_normalZ, linkType, configID;
+					float wallDistance=0.0, normalX=0.0, normalY=0.0, normalZ=0.0;
+
+					linkType = dir_ldata[0];
+					configID = dir_ldata[1]; 
+					lu_wallDistance = dir_ldata[2]; 
+					lu_normalX = dir_ldata[3];
+					lu_normalY = dir_ldata[4];
+					lu_normalZ = dir_ldata[5];
+
+					newsite.links[linkdir].linkType = (uint32_t) linkType;
+					newsite.links[linkdir].configID = (uint32_t) configID;
+
+					wallDistance = (float)(*(reinterpret_cast<double*>(&lu_wallDistance)));
+					normalX = (float)(*(reinterpret_cast<double*>(&lu_normalX)));
+					normalY = (float)(*(reinterpret_cast<double*>(&lu_normalY)));
+					normalZ = (float)(*(reinterpret_cast<double*>(&lu_normalZ)));
+
+					newsite.links[linkdir].wallDistance = wallDistance;
+
+					// if link is to a wall...
+					if(newsite.links[linkdir].linkType == 1) {
+						newsite.hasWallNormal = true;
+						newsite.normalX += normalX;
+						newsite.normalY += normalY;
+						newsite.normalZ += normalZ;
+						num_intersections++;
+					}
+				}
+
+				if ( newsite.hasWallNormal ) {
+					newsite.normalX /= (float) num_intersections;
+					newsite.normalY /= (float) num_intersections;
+					newsite.normalZ /= (float) num_intersections;
+				}
+
+				converted.push_back(newsite);
+				conv_sites[ i ] = &converted[ converted.size()-1 ];
+			} // if site_ptr
+		} // loop over sites in the block.
+
+		// At this point we can encode the conv_sites to XDR
+		// First we need to work out the uncompressed block length
+
+		// compression and decompression buffers:
+		std::vector<char> decompressedBuffer(max_buffer_size);
+		std::vector<char> compressedBuffer(max_buffer_size);
+
+		uint32_t blockUncompressedLen = 0;
+		for( int i=0; i < blockSites; i++) { 
+			OutputSite* siteptr = conv_sites[i]; 
+			if( siteptr == nullptr ) { // if solid 
+				blockUncompressedLen += sizeof(uint32_t); // SiteIsSimulated
+			}
+			else { // if fluid
+				blockUncompressedLen += sizeof(uint32_t); // SiteIsSimulated
+				for(uint32_t m = 0; m < 26; m++) {
+					blockUncompressedLen += sizeof(uint32_t); // linkType
+					uint32_t linkType = siteptr->links[m].linkType;
+					switch (linkType) {
+						case 0: // linkType = FLUID (no further data)
+							break;
+						case 1: // linkType = WALL (write distance to nearest obstacle)
+							blockUncompressedLen += sizeof(float); // wallDistance
+							break;
+						case 2:
+						case 3: // linkType = INLET or OUTLET (write config ID and distance to nearest obstacle)
+							blockUncompressedLen += sizeof(uint32_t); // configEntry
+							blockUncompressedLen += sizeof(float); // wallDistance
+							break;
+						default:
+							fprintf(stderr, "ERROR: Unrecognised linkType %u.\n", linkType);
+							MPI_Finalize();
+							exit(1);
+					}
+				}
+				uint32_t hasWallNormal = (siteptr->hasWallNormal == true);
+				blockUncompressedLen += sizeof(uint32_t); // hasWallNormal
+				if (hasWallNormal == 1) {
+					blockUncompressedLen += sizeof(float); // normalX
+					blockUncompressedLen += sizeof(float); // normalY
+					blockUncompressedLen += sizeof(float); // normalZ
+				}
+			}
+		}
 		
-			*bufit = p.first; bufit++;
-			*bufit = p.second; bufit++;
+		binfo.header.uncompressedBytes = blockUncompressedLen;
+
+		XDR xdrbs;
+		xdrmem_create(&xdrbs, (char *)decompressedBuffer.data(), blockUncompressedLen, XDR_ENCODE);
+
+		// Encode the block
+		for(int i=0; i < blockSites; i++) {
+			OutputSite* siteptr = conv_sites[i];
+			uint32_t siteIsSimulated = ( siteptr != nullptr ) ? 1 : 0;
+			xdr_u_int(&xdrbs, &siteIsSimulated);
+
+			if( siteIsSimulated == 0 ) continue;
+
+			for( uint32_t link=0; link < 26; link++) {
+
+				// write type of link
+				uint32_t linkType = siteptr->links[link].linkType;
+				xdr_u_int(&xdrbs, &linkType);
+				switch (linkType) {
+					case 0: // linkType = FLUID (no further data)
+						break;
+					case 1: // linkType = WALL (write distance to nearest obstacle)
+						xdr_float(&xdrbs, &(siteptr->links[link].wallDistance));
+						break;
+					case 2: // linkType = INLET (write inletID and distance to nearest obstacle
+						xdr_u_int(&xdrbs, &(siteptr->links[link].configID));
+						xdr_float(&xdrbs, &(siteptr->links[link].wallDistance));
+						break;
+					case 3: // linkType = OUTLET (write outletID and distance to nearest obstacle
+						xdr_u_int(&xdrbs, &(siteptr->links[link].configID));
+						xdr_float(&xdrbs, &(siteptr->links[link].wallDistance));
+						break;
+					default:
+						fprintf(stderr, "ERROR: Unrecognised linkType %u.\n", linkType);
+						MPI_Finalize();
+						exit(1);
+				}
+			}
+
+				// state if there are wall normal coordinates to be read (1 for yes)
+			uint32_t hasWallNormal = (siteptr->hasWallNormal == true)? 1: 0;
+			xdr_u_int(&xdrbs, &hasWallNormal);
+			if (hasWallNormal == 1) {
+				// write wall normal coordinates as separate floats
+				xdr_float(&xdrbs, &(siteptr->normalX));
+				xdr_float(&xdrbs, &(siteptr->normalY));
+				xdr_float(&xdrbs, &(siteptr->normalZ));
+			}
+		}
+
+		xdr_destroy(&xdrbs);
+		// Now we compress
+		z_stream strm;
+
+		// setup zlib for compression
+		strm.zalloc = Z_NULL;
+		strm.zfree = Z_NULL;
+		strm.opaque = Z_NULL;
+
+		// input
+		strm.avail_in = blockUncompressedLen;
+		strm.next_in = (Bytef *)decompressedBuffer.data();
+
+		// output
+		strm.avail_out = max_buffer_size;
+		strm.next_out =(Bytef *)compressedBuffer.data();
+
+		uint32_t ret;
+		ret = deflateInit(&strm, Z_BEST_COMPRESSION);
+		if(ret != Z_OK) {
+			fprintf(stderr, "ERROR: zlib deflation init.\n");
+			MPI_Finalize();
+			exit(1);
+		}
+		ret = deflate(&strm, Z_FINISH);
+		if (ret != Z_STREAM_END) {
+			fprintf(stderr, "ERROR: Deflation error for block.\n");
+			MPI_Finalize();
+			exit(1);
+		}
+		ret = deflateEnd(&strm);
+		if (ret != Z_OK) {
+			fprintf(stderr, "ERROR: Deflation end error for block.\n");
+			MPI_Finalize();
+			exit(1);
+		}
+
+		// get new compressed size
+		uint32_t blockCompressedLen = (unsigned char*)strm.next_out - (unsigned char*)compressedBuffer.data();
+		binfo.header.bytes = blockCompressedLen;
+		memcpy(&outputBuffer[outbuf_idx], compressedBuffer.data(), blockCompressedLen);
+		outbuf_idx += blockCompressedLen;
+	} 
+	
+	double convert_endtime=MPI_Wtime(); 
+	if (this_rank == 0 ) std::cout << "Data conversion and compression completed: " << convert_endtime-convert_starttime << " sec.\n";
+
+
+	if (this_rank == 0 ) std::cout << "Gathering information for parallel I/O\n";
+
+	uint64_t rank_compressed_bytes = outbuf_idx;  // This is the total number of compressed data on the local rank
+												  // setto this value after the compression loop
+
+	// Get the total compressed bytes in the file
+	uint64_t total_compressed_bytes = 0;
+
+	// Get the offsets of the compressed data in the file
+	uint64_t compressed_offset = 0;
+
+	// At this point we can get a total file size for the data portion.
+	MPI_Allreduce( &rank_compressed_bytes, &total_compressed_bytes, 1, MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+	// We can also get the offsets of the data (from the end of the headers) for each rank by performaing an exclusive prefix scan.
+	MPI_Exscan(&rank_compressed_bytes, &compressed_offset, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+	// To fill out the header info we need the maximum compressed and uncompressed bytes as well as total number of non-empty blocks
+	// We may have these already but they are easy to find by traversing out map.
+	uint32_t global_max_uncompressed_bytes=0;
+	uint32_t global_max_compressed_bytes=0;
+	{
+		// We can compute the maxes of both the uncompressed and copressed in a single loop
+		// then we can do a length 2 MPI Allreduce 
+		uint32_t local_maxes[2] ={0, 0};
+		for( const auto& kv : output_info ) {
+			const auto& header = kv.second.header;
+			if( header.bytes > local_maxes[0] ) local_maxes[0] = header.bytes;
+			if( header.uncompressedBytes > local_maxes[1] ) local_maxes[1] = header.uncompressedBytes;
+		} 
+		uint32_t global_maxes[2] = {0,0}; 
+		MPI_Allreduce(local_maxes, global_maxes, 2, MPI_UINT32_T, MPI_MAX, MPI_COMM_WORLD);
+		global_max_compressed_bytes = global_maxes[0];
+		global_max_uncompressed_bytes = global_maxes[1];
 	}
+
+	// The number of non empy blocks localy is just the number of elements in output info
+	uint64_t global_nonempty_blocks=0;
+	{	
+		uint64_t local_nonempty_blocks = output_info.size();
+		MPI_Allreduce(&local_nonempty_blocks, &global_nonempty_blocks, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+	}
+
+	if ( this_rank == 0 ) { 
+		std::cout << "Global Nonempty Blocks = " << global_nonempty_blocks << "\n";
+		std::cout << "Preparing Preamble and headers\n";
+	}
+
+	// Now fill out the Preamble Info
+	OutputPreambleInfo pinfo;
+	pinfo.HemeLBMagic = HemeLbMagicNumber;         // From gmy.h
+	pinfo.GmyNativeMagic = GmyNativeMagicNumber;   // From gmy.h  
+	pinfo.Version = GmyNativeVersionNumber;        // From gmy.h
+	pinfo.BlocksX = nBlocksX;					   // From earlier calculations
+	pinfo.BlocksY = nBlocksY;
+	pinfo.BlocksZ = nBlocksZ;
+	pinfo.BlockSize = blockDim;				       // We set this as constexpr earlier in the file
+	pinfo.MaxCompressedBytes = global_max_compressed_bytes;			// We computed this (these are per-block quantities so uint32_t is safe)
+	pinfo.MaxUncompressedBytes = global_max_uncompressed_bytes;     // We computed this  (these are per-block quantities so uint32_t is safe)
+	// Header offset is 56 -- default on construction
+	pinfo.NonEmptyBlocks = global_nonempty_blocks;					// We computed this 
+
+	// This is the offset to the data: HeaderOffset is fixed at 56. NonemptyHeaderRecordSize is 28. 
+	// NB: the sizeof(NonEmptyHeaderRecord) comes to 32 because of 8 byte alignment. so we use the byte count of 28 rather than sizeof()
+	pinfo.DataOffset = pinfo.HeaderOffset + pinfo.NonEmptyBlocks*NonemptyHeaderRecordSize;
+
+	
+	// Now the headers
+	// We walk the map and unroll it into a vector for writing
+	std::vector<NonEmptyHeaderRecord> local_header( output_info.size() );
+	uint64_t header_idx = 0;
+	for( const auto& kv : output_info )  {
+		local_header[header_idx] = kv.second.header;
+		header_idx++;
+	}
+	
+	// Each rank needs to offset its write to not stomp on the other nodes headers. 
+	// We can work out the displacements using an exclusive scan
+	uint64_t header_offset = 0;
+	MPI_Exscan( &header_idx, &header_offset, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD );
+	
+	// Header offset now holds where my rank should wrirte in units of NonEmptyHeaderRecords. 
+	// Let us convert this to bytes
+	header_offset *= NonemptyHeaderRecordSize;  // NB: The size of the struct is 32 from sizeof because of alignment we don't want to pad
+
+	// And let us add on the Preamble offset. 
+	header_offset += pinfo.HeaderOffset;
+
+	// This is just to convert to an MPI_Offset (from uint64_t)
+	MPI_Offset my_header_offset = header_offset; // Offset to start writing our local array
+	
+	// Now we will make an MPI type for our header: 5 elements (blocks): 2 uint64_ts, 3 uint32_ts
+	MPI_Datatype header_type;
+	int blen[5] = {1,1,1,1,1};  // Number of elements in each 'block'
+	MPI_Aint  bdisp[5] = {0,8,16,20,24}; // Displacements of the elements
+	MPI_Datatype btypes[5] = { MPI_UINT64_T, MPI_UINT64_T, MPI_UINT32_T, MPI_UINT32_T, MPI_UINT32_T };
+	MPI_Type_struct( 5, blen, bdisp, btypes, &header_type );
+	MPI_Type_commit(&header_type);
+
+	size_t chunk_size = 2*1024*1024; // 2 MiB transaction size
+	
+
+	// OK. We need to open an output file.
+	if( this_rank == 0 ) std::cout << "Opening and writing SGMY file\n";
+
+	MPI_File out_fh;
+	MPI_File_open(MPI_COMM_WORLD, output_filename.c_str(), MPI_MODE_CREATE | MPI_MODE_APPEND| MPI_MODE_WRONLY, MPI_INFO_NULL, &out_fh);
+	double startio = MPI_Wtime();
+	
+	// Now for the IO part
+	// Rank 0 writes the preamble
+	if( this_rank == 0 ) {
+		MPI_Status status;
+		MPI_File_write_at(out_fh, 0, &pinfo, pinfo.HeaderOffset, MPI_BYTE, &status);
+	}
+
+	// Everyone writes the headers using collective write_at_all()
+	// FIXME:  Check return and status
+	MPI_Status header_write_status;
+	MPI_File_write_at_all(out_fh, my_header_offset, local_header.data(), header_idx, header_type, &header_write_status); 
+
+	// Now write the data. We are going to write a stream of bytes, but we may have that we have over 2GB locally to write.
+	// So unless we make a large type that is hard. However making a large type is also hard because each block may have 
+	// a different compressed length. So we will use a transaction size (2 MiB) in this case and loop with that until 
+	// we reach the end of the data for each rank.
+	// Compressed offset is from the exclusive scan earlier;
+	MPI_Offset data_offset = pinfo.DataOffset + compressed_offset;     // This is our initial offset. Data offset plus the exclusive scan we did earlier.
+
+	// Writing loop: we will start writing locally at &outputBuffer[bytes_written] and write bytes_to_write bytes
+	// bytes_to_write will be our chunk size, or a mop-up amount at the end of the data which is less.
+	// Then we increase 'bytes_written' and the start offset by the amount we just wrote.
+	// Finally in principle each process could have different amounts of data, so I will use the "MPI_File_write_at_all" collective MPI I/O routine
+	size_t bytes_written = 0;
+	while( bytes_written < rank_compressed_bytes ) {
+
+		// Determine bytes to write
+		size_t bytes_to_write =  ( bytes_written + chunk_size > rank_compressed_bytes ) ? rank_compressed_bytes - bytes_written : chunk_size; 
+
+		// Do the write:
+		// FIXME: Check status
+		MPI_Status mpi_data_write_status;
+		MPI_File_write_at(out_fh, data_offset, &outputBuffer[bytes_written], bytes_to_write, MPI_BYTE, &mpi_data_write_status);
+
+		// Increase bytes_written (start location in our local buffer) 
+		bytes_written += bytes_to_write;
+
+		// Increase offset (start_location in the file)
+		data_offset += bytes_to_write;
+	}
+	
+	// We are done	
+	double endio = MPI_Wtime();
+
+	MPI_File_close(&out_fh);
+	if( this_rank == 0 ) {
+		double io_time = endio-startio;
+		uint64_t size_in_bytes = pinfo.DataOffset + total_compressed_bytes;
+		double size_in_GiB = (double)(size_in_bytes)/(double)(1024*1024*1024);
+		std::cout << "Output IO took: " << endio - startio << " sec. Average BW: " << size_in_GiB/io_time << " GiB/sec. \n";
+		std::cout << "Expected file size = " << size_in_bytes  << " bytes = " << size_in_GiB <<" GiB\n";
+	}	
 }
 
-
-void unpackBlockLocation( std::vector< uint64_t>::const_iterator& bufit, 
-						  std::unordered_map<uint64_t, std::vector<BlockLocation>>& gmap)
+void processRecordData(RawData& rd)
 {
-	uint64_t block_id = *bufit; bufit++;
-	BlockLocation bl;
-
-	bl.rank = *bufit; bufit++;
-	uint64_t n_sites = *bufit; bufit++;
-	bl.site_offsets.resize(n_sites);
-
-	for(uint64_t site = 0; site < n_sites; site++) {
-		uint64_t site_id = *bufit; bufit++; 
-		uint64_t record_offset = *bufit; bufit++;
-
-		bl.site_offsets[site] = std::make_pair<>(site_id,record_offset);		
-	}
-	if( gmap.find( block_id) == gmap.end() ) {
-		// Insert 
-		gmap[ block_id ] = {bl}; // Rely on copy constructor
-	}
-	else {
-		// add 
-		gmap[block_id].push_back( bl ); // rely on copy constructor
-	}
-}
-
-#endif
-
-
-void processRecordData(const RawData& rd , RawData& remote_data)
-{
+	std::map< uint64_t, std::vector< Site* > > local_blocksite_map;
 	/*
 	 * Step 1: Work out size of the Block Grid
 	 */
-	uint64_t nBlocksX=0;
-	uint64_t nBlocksY=0; 
-	uint64_t nBlocksZ=0;
-
-	int this_rank = rd.this_rank;
-	int num_ranks = rd.num_ranks;
+	this_rank = rd.this_rank;
+	num_ranks = rd.num_ranks;
 
 	if (this_rank == 0 ) std::cout << "Determining size of block grid\n";
 	double minmaxstart = MPI_Wtime();
 	// First we need to establish max_blocks
  	#pragma omp parallel reduction(max: nBlocksX, nBlocksY, nBlocksZ)
 	for(size_t i=0; i < rd.local_num_records; i++) {
-		uint64_t x=rd.record_data[i*RawData::record_size];
-		uint64_t y=rd.record_data[i*RawData::record_size+1];
-		uint64_t z=rd.record_data[i*RawData::record_size+2];
+		const Site& sitedata = rd.record_data[i];
+		uint64_t x=sitedata.x;
+		uint64_t y=sitedata.y;
+		uint64_t z=sitedata.z;
 		uint64_t blockX = x/blockDim + 1;
 		uint64_t blockY = y/blockDim + 1;
 		uint64_t blockZ = z/blockDim + 1;
@@ -138,13 +566,13 @@ void processRecordData(const RawData& rd , RawData& remote_data)
 	local_blocksite_map.clear();
 
 	// Now go through the array and populate my map
-	for(uint64_t rec_idx=0; rec_idx < rd.local_num_records; rec_idx++) {
+	for(uint64_t rec_idx=0; rec_idx < rd.record_data.size(); rec_idx++) {
 
 		// Determine block_id and site_id
 		// Coordinates run as: Z, Y, X   with Z slowest
-		uint64_t x=rd.record_data[ rec_idx * RawData::record_size];
-		uint64_t y=rd.record_data[ rec_idx * RawData::record_size+1];
-		uint64_t z=rd.record_data[ rec_idx * RawData::record_size+2];
+		uint64_t x=rd.record_data[ rec_idx ].x;
+		uint64_t y=rd.record_data[ rec_idx ].y;
+		uint64_t z=rd.record_data[ rec_idx ].z;
 		uint64_t blockX = x/ blockDim;
 		uint64_t blockY = y/ blockDim;
 		uint64_t blockZ = z/ blockDim;
@@ -157,11 +585,11 @@ void processRecordData(const RawData& rd , RawData& remote_data)
 		// If we have no block in our map	
 		// Insert an empty vector
 		if( local_blocksite_map.find( block_id ) == local_blocksite_map.end() ) {
-			local_blocksite_map.insert( std::pair<uint64_t, std::vector<uint64_t*> >( block_id, std::vector<uint64_t*>()) );
+			local_blocksite_map.insert( std::pair<uint64_t, std::vector<Site*> >( block_id, std::vector<Site*>()) );
 		}
 
 		// Push back the site id, and the index in the array
-		std::vector<uint64_t*>& the_vec = local_blocksite_map.at(block_id);
+		std::vector<Site*>& the_vec = local_blocksite_map.at(block_id);
 		the_vec.push_back( rd.getPtrToSite(rec_idx) );
 	}
 	double insertend = MPI_Wtime();
@@ -174,263 +602,225 @@ void processRecordData(const RawData& rd , RawData& remote_data)
 	}
 
 	if( fluid_sites != rd.local_num_records ) {
-		std::cout << "Rank " << this_rank << " : something wrong. Epxected " << rd.local_num_records
+		std::cout << "Rank " << this_rank << " : something wrong. Expected " << rd.local_num_records
 			<< " but found only " << fluid_sites << "\n";
 			exit(-1);
 	}
 	MPI_Barrier(MPI_COMM_WORLD); // Wait until all insertions are completed
 	if( this_rank == 0) {
-		std::cout << "Rank " << this_rank << " : Consistency check passed\n"; } /* *  Step 3: Generate a list of unique local keys as an array */ std::vector< uint64_t > local_blockids;
+		std::cout << "Consistency check passed\n"; 
+	} 
 
-	/* Step 4: Uniquify IDs per node.
-	 *    Algorithm: Send my unique block_ids to my upper neighbor.
-	 *     Upper neighbor will receive my list. Traverse it and move matching blocks to its 'remote' map.
-	 *     We can do this with broadcasts e.g. 
-	 *     
-     *          for root node in 0 ... n_ranks-1
-     *               root node broadcasts list
-	 *               if ( rank > root node ) process list 
-     * 
-	 *     This way we should end up with:
-	 *       rank 0: original blocks (local) 
-	 *       rank 1: original blocks - rank 0 blocks (local)      rank 0 blocks (remote) 
-	 *   	 rank 2: original blocks - rank 1 blocks - rank 0 blocks (local)  rank 0 blocks, rank 1 blocks (remote) 
-	 *       ...
-	 *       rank N-1:   original blocks - blocks from all previous ranks (local),    blocks to all previous ranks (remote)
-	 *       
-	 *       Set theory can be used to show that each rank will have a unique set of blocks
-	 */
-	for( int root_rank = 0; root_rank < num_ranks-1; root_rank++ ) {
-		if ( this_rank == root_rank ) std::cout << "Root rank is " << root_rank << "\n";
+	/* *  Step 3: Generate a list of unique local keys as an array */ 
+	// Get Unique Block IDs
+	std::set< uint64_t > global_blockids_set;
+	{
+
+		/* Intermediate step. We need to arrange things so that each rank holds a similar number of blocks 
+		 * The way to do this is to find minimum and maximum block-Ids for each node */
+
+		/* Create a vector of unique local block ids */
+		std::vector<uint64_t> local_blockids;
+		local_blockids.reserve(local_blocksite_map.size());
+		for( const auto& kv : local_blocksite_map ) local_blockids.push_back( kv.first );
+
+		/* Gather the number of unique block_ids for each rank */
+		std::vector<int> blockid_sizes(num_ranks);
+		int my_blockid_size = local_blockids.size();
+		MPI_Allgather(&my_blockid_size, 1, MPI_INT, blockid_sizes.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+		/* Now gather the blockids themselves using a Gatherv. 
+		   Each Rank will send its unique blockids 
+		   To find out where each unique_blockid should come we need displacements 
+		*/
 	
-		// Collect the local blockids for the root rank	
-		local_blockids.resize(local_blocksite_map.size());
-		auto iterator = local_blockids.begin();
-		for( const auto& kv : local_blocksite_map ) { 
-		  *iterator = kv.first; iterator++;
+		/* We will use total blocks for the size ofthe receive array. Just sum the 
+		   gathered blocksizes */	
+		size_t total_blocks =0;
+		for( auto blocksize : blockid_sizes )  total_blocks += blocksize;
+
+		/* We will compute the displacement of the data from each rank based on blockid_sizes */	
+		std::vector<int> displace( num_ranks );
+		displace[0] = 0;
+		for(int i=1; i < num_ranks; i++) displace[i] = displace[i-1] + blockid_sizes[i-1];
+
+		/* Allocate the receive buffer */
+		std::vector<uint64_t> all_blockids( total_blocks );
+
+		/* Gather the data */	
+		MPI_Allgatherv(local_blockids.data(), local_blockids.size(), MPI_UINT64_T, all_blockids.data(), blockid_sizes.data(), displace.data(), MPI_UINT64_T, MPI_COMM_WORLD);
+
+		/* Now insert al the blockids -- duplicate inserts will fail */
+		for( const auto& blockid : all_blockids ) {
+			global_blockids_set.insert(blockid);
 		}
+	}	
 
-		// It is a sorted map so this is a sorted list
-		uint64_t root_minmax[2] = { local_blockids[0], local_blockids[ local_blockids.size()-1 ] };
 
-		// DEBUG Message:
-		// std::cout << "Rank " << this_rank << " :  block range = ( "<< root_minmax[0] << " , " << root_minmax[1] << " )\n"; 
+	/* Now we have somenew stats */
+	size_t n_blocks_global = global_blockids_set.size();
+	uint64_t n_blocks_per_rank = n_blocks_global/num_ranks;
+	uint64_t n_blocks_last_rank = n_blocks_global - ( n_blocks_per_rank * (num_ranks-1) );
+	uint64_t n_blocks_for_my_rank = ( this_rank == num_ranks-1 ) ? n_blocks_last_rank : n_blocks_per_rank;
 
-		// Send out min and max
-		MPI_Bcast( &root_minmax, 2, MPI_UINT64_T, root_rank, MPI_COMM_WORLD);
-
-		if ( this_rank > root_rank ) {
-			
-			// Filter the local blocksite map
-			using srciter_t = decltype( local_blocksite_map.begin() );
-
-			std::vector<srciter_t> matching_iterators;
-
-			for(srciter_t iterator = local_blocksite_map.begin(); iterator != local_blocksite_map.end(); iterator++ ) {
-				const auto& kv = *iterator; // kv = (key, value)
-				uint64_t this_block = kv.first;
-	
-				// We want to consider everything less than the max of the node 0
-				bool condition1 = ( root_rank == 0 ) && ( this_block <= root_minmax[1] );
-				bool condition2 = ( root_rank != 0 ) && ( this_block > root_minmax[0] ) && (this_block <= root_minmax[1]);
-
-				// If either condition1 or condition 2 is fulfilled  
-				if(  condition1 || condition2 ) {
-					const std::vector<uint64_t*>& vector_from_local_block = kv.second;
-
-					// Insert an empty value into the remote map if the block is not there already
-					if( remote_blocksite_map.find(this_block) == remote_blocksite_map.end() ) {
-						remote_blocksite_map[ this_block ] =  {root_rank , 
-																	 std::vector<uint64_t*>(vector_from_local_block.begin(), 
-																		vector_from_local_block.end())};
-					}
-					else {
-						// Append the sites (copy)	
-				    	std::vector<uint64_t*>& vector_for_remote_block = (remote_blocksite_map.at(this_block)).sites;
-						vector_for_remote_block.insert( vector_for_remote_block.end(), vector_from_local_block.begin(),
-														vector_from_local_block.end() );
-					}	
-					// Remve the block from the local blocksite	
-					matching_iterators.push_back(iterator);
-				} // Relocate block
-			} // loop blocks
-
-			for( auto it : matching_iterators ) local_blocksite_map.erase(it);	
-		} // if rank > root
-	} // loop over root ranks
-
-	// At this point, we should have separated our local Blocks and our remote blocks 
-	// we should not have lost any sites just reassigned them
-	// It makes sense to do some sanity checking. 
-	size_t local_blocks = 0;
-	size_t remote_blocks = 0;
-	size_t local_sites = 0;
-	size_t remote_sites = 0;
-	for( const auto& block : local_blocksite_map ) {
-		local_blocks++;
-		const std::vector< uint64_t*>& sites = block.second;
-		local_sites += sites.size();
-	}
-	for( const auto& block : remote_blocksite_map ) { 
-		remote_blocks++;
-		const std::vector< uint64_t* >& sites = block.second.sites;
-		remote_sites += sites.size();
-	}
-	size_t total_sites = remote_sites + local_sites; 
-	if( total_sites != rd.local_num_records ) { 
-		std::cout << "Rank " << this_rank << " : inconsitency: remote and local sites do not total up\n"; 
- 		abort();
+	if ( this_rank == 0 ) {
+		std::cout << "Num Unique Blocks: " << n_blocks_global << " Blocks_per_rank: " << n_blocks_per_rank << " Blocks_last_rank: " << n_blocks_last_rank << "\n";
 	}
 
-	if( remote_blocks > 0 ) { 
-		std::cout << "Rank " << this_rank << " : local (blocks, sites) = ( " << local_blocks << " , " << local_sites << " ) "
-			<< "  remote ( blocks, sites  ) = ( " << remote_blocks << " , " << remote_sites << " ) "
-			<< "  remote data = " << static_cast<double>(remote_sites*RawData::record_size*sizeof(uint64_t))/static_cast<double>(1024*1024) << " MiB\n";
+	/* Now create a vector of the global blockids */
+	const auto& set_iterator = global_blockids_set.begin();
+	std::vector<uint64_t> unique_blockids( global_blockids_set.begin(), global_blockids_set.end());
+	if ( this_rank == 0 ) std::cout << "Global Min Block ID = " << unique_blockids[0] << " Max Block ID = " << unique_blockids[ unique_blockids.size() -1 ] << "\n";
+
+	if( this_rank == 0) std::cout << "Starting data rearrangement\n";
+	if( this_rank == 0) std::cout << "--> Splitting blocks into ranges\n";
+ 
+	/* Now divide this up */
+	std::vector<uint64_t> minblock_for_rank(num_ranks);
+	int index=0;	
+	for(int i=0; i < num_ranks; i++) {
+	   minblock_for_rank[i] = unique_blockids[index];
+	   index += n_blocks_per_rank;
 	}
 
-	/* Step 5
-	 * Gather the remote data
+	if( this_rank == 0) std::cout << "--> reassigning blocks to ranks\n";
+	/* Now each rank has its range:
+		rank = 0...N-2 :   minblock_for_rank[ rank ] <= block < minblock_for_rank[ rank + 1 ]
+		rank = N-1 : minblock_for_rank[N-1] <= block <= global_max_block
 	 */
-	/* An MPI type to avoid some count overruns */
-	MPI_Datatype site_datatype;
-    MPI_Type_contiguous(RawData::record_size, MPI_UINT64_T, &site_datatype);
-    MPI_Type_commit(&site_datatype);
+	std::map< int, std::vector<Site*> > distribution_map;
+	std::vector< uint64_t > sites_to_rank(num_ranks);
+	for(int i=0; i < num_ranks; i++)  sites_to_rank[i]=0;
 
-	for( int dest = 0; dest < num_ranks-1;  dest++) {
-		if ( this_rank == dest) std::cout << "Gathering onto rank " << dest << "\n";
-		std::vector<uint64_t> allbufsizes(num_ranks);
-		uint64_t bufsize=0;
+	// Go through the local blocksite map
+	for( auto& kv : local_blocksite_map ) {
+	  uint64_t blockid = kv.first;
 
-		if( this_rank > dest ) { // senders only 
-			 	
-			// Trawl the remote_blocklist for blocks that should go to dest 
-			int sites_to_send = 0;
+	  // Find the destination rank
+	  int dest_rank = 0; 
+	  for(int i=1; i < num_ranks; i++) {
+		if( blockid >= minblock_for_rank[i] ) dest_rank++;
+	  }
 
-			// Only sites higher than the root rank will send
-			for( const auto& block : remote_blocksite_map ) {
-				// Grab the remote entry for the block
-				const RemoteEntry& rem = block.second;
-				if( rem.dest_rank == dest ) {
-					// This will need to be sent to the destination so increas bufsize
-					sites_to_send  += rem.sites.size();
-				}
-			}
-		
+	  std::vector<Site*>& site_ptrs = kv.second;
 
-			// The total buffer size in units of sites
-			bufsize = sites_to_send;
+	  // Increase the count
+	  sites_to_rank[ dest_rank ] += site_ptrs.size();
+
+	  // Copy over the distribution_map
+	  if( distribution_map.find(dest_rank) == distribution_map.end() ) {
+		distribution_map[ dest_rank ] = std::vector<Site*>();
+	  }
+	  std::vector<Site*>& dist_sites = distribution_map[ dest_rank ];
+	  dist_sites.insert( dist_sites.end(), site_ptrs.begin(), site_ptrs.end() ); 
+	}
+
+	
+	std::vector<uint64_t> displs_to_rank( num_ranks );
+	displs_to_rank[0] = 0;
+	for( int i=1; i < num_ranks; i++) displs_to_rank[i] = displs_to_rank[i-1]+sites_to_rank[i-1];
+
+	std::vector<Site> sites_to_scatter( rd.record_data.size() );
+	uint64_t idx=0;
+	for(const auto& kv : distribution_map ) {
+		std::vector<Site*> site_ptrs = kv.second;
+		for( Site* src_ptr : site_ptrs ) {
+			sites_to_scatter[idx] = *src_ptr; // copy
+			idx++;
 		}
-		MPI_Allgather( &bufsize, 1, MPI_UINT64_T, allbufsizes.data(), 1, MPI_UINT64_T, MPI_COMM_WORLD);
+	}
 
-		if( this_rank == dest ) {  // Receiver 
-			std::cout << "Rank " << dest << " : to receive \n";
-			uint64_t sum = 0;
-			for(int i=dest + 1; i < num_ranks; i++ ) {
-				uint64_t b = allbufsizes[i];
-				sum+=b;
-				if( b > 0 ) std::cout << "\t " << b << " sites from rank " << i 
-				 	<< " : " <<  (double)(b*RawData::record_size*sizeof(uint64_t))/(double)(1024*1024*1024) << " GiB\n";
-			}
-			std::cout << "\t Total = " << sum << " sites = " << (double)(sum*RawData::record_size*sizeof(uint64_t))/(double)(1024*1024*1024) << " GiB\n";
-			
-			// Prepost receives ( received buf -- remember we want the number of records
-			// to the allocation function whereas sum is in terms of uint64_ts 
-			//
-			remote_data.allocate( sum );
+	local_blocksite_map.clear();
+	distribution_map.clear();
+	rd.record_data.clear();
 
-            size_t disp=0;
-			int recidx=0;
-			std::vector<MPI_Request> recv_reqs( num_ranks );
-			std::vector<MPI_Status>  recv_stats( num_ranks );
-			for(int recrank = dest+1; recrank < num_ranks; recrank++) {
-				if( allbufsizes[ recrank ] > 0 ) {
-					MPI_Irecv( &remote_data.record_data[ disp ], allbufsizes[ recrank ], site_datatype, recrank, recrank, MPI_COMM_WORLD, &recv_reqs[recidx]);
-					disp += allbufsizes[ recrank ]*RawData::record_size;
-					recidx++;
-				}
-			}
-		   	MPI_Waitall( recidx, recv_reqs.data(), recv_stats.data() ); 
-			remote_data.local_num_records=sum/RawData::record_size;
-		}
-		else {
-			if( this_rank > dest && bufsize > 0 ) { // Senders	
-				MPI_Request send_req;
-				MPI_Status send_stat;
-				std::vector<uint64_t> sendbuf(bufsize*RawData::record_size);
-				std::vector<uint64_t>::iterator iter = sendbuf.begin();
+	// In order to exchange the data. I will need to know how many sites I will get from each other rank. In other
+	// words I need the sites_to_rank arrays from all the ranks
+	std::vector< uint64_t > sites_to_rank_global( num_ranks * num_ranks );
+	{
+		MPI_Allgather( sites_to_rank.data(), num_ranks, MPI_UINT64_T, sites_to_rank_global.data(), num_ranks, MPI_UINT64_T, MPI_COMM_WORLD);
+	}
 
-				for( const auto& kv: remote_blocksite_map ) {
-					const RemoteEntry& rem = kv.second;
-					if( rem.dest_rank == dest ) {
+	if( this_rank == 0 ) std::cout << "--> Communicating the sites to new ranks\n";
+	
+    {
+		// Now we want to do a humongous alltoall. Trouble is something goes wrong here, perhaps 
+		// the displacements get too big? So I am splitting it into O(num_ranks) sendrecvs
+		//
 
-						std::vector<uint64_t*> site_ptrs = rem.sites;
-						for(int site_idx=0; site_idx < site_ptrs.size(); site_idx++) { 
-							uint64_t* src=site_ptrs[site_idx];
-							for(int i=0; i< RawData::record_size;i++) { 
-								*iter=*src;
-								iter++;
-								src++;
-							}
-						}
-					}
-				}
-				uint64_t checksum = 0;
-				for(int i=0; i < bufsize; i++) { 
-					checksum += sendbuf[i];
-				}
-				if( checksum == 0 ) { 
-					std::cout << "Rank " << this_rank << " : sending a whole bunch of nothing\n";
-				}
-				MPI_Isend(sendbuf.data(), bufsize, site_datatype, dest, this_rank, MPI_COMM_WORLD, &send_req);
-				
-				MPI_Wait(&send_req, &send_stat);
-            }
+		MPI_Datatype site_mpi_type;
+		MPI_Type_contiguous(rd.record_size, MPI_UINT64_T, &site_mpi_type);
+   		MPI_Type_commit(&site_mpi_type);
+	
+		std::vector<MPI_Request> reqs(2*num_ranks);
+
+		std::vector<uint64_t> rcounts(num_ranks) ;
+		std::vector<uint64_t> rdispls(num_ranks) ;
+
+		uint64_t total_rec = 0;
+		for(int i=0; i < num_ranks; i++) { 
+			rcounts[i]=sites_to_rank_global[this_rank + i*num_ranks];
+			if ( rcounts[i] > std::numeric_limits<int>::max() ) 
+				std::cout << "Rank " << this_rank << " : Receive count over integer size limit from rank " << i << " rcounts[i]=" << rcounts[i] << "\n";
+			total_rec += rcounts[i];
 		}
 
-		if( this_rank == dest ) {	
-			// Now receiver inserts the remote data into my block map
-   			for(uint64_t rec_idx=0; rec_idx < remote_data.local_num_records; rec_idx++) {
+		rdispls[0]=0;
+		for(int i=1; i < num_ranks; i++) { 
+			rdispls[i] = rdispls[i-1]+rcounts[i-1];
+		}
 
-				 // Determine block_id and site_id
-				 // Coordinates run as: Z, Y, X   with Z slowest
-				uint64_t x=remote_data.record_data[ rec_idx * RawData::record_size];
-				uint64_t y=remote_data.record_data[ rec_idx * RawData::record_size+1];
-				uint64_t z=remote_data.record_data[ rec_idx * RawData::record_size+2];
-				uint64_t blockX = x/ blockDim;
-				uint64_t blockY = y/ blockDim;
-				uint64_t blockZ = z/ blockDim;
-				uint64_t siteX = x % blockDim;
-				uint64_t siteY = y % blockDim;
-				uint64_t siteZ = z % blockDim;
-				uint64_t block_id = blockZ + nBlocksZ * (blockY + nBlocksY * blockX);
-				uint64_t site_id = siteZ + blockDim * (siteY + blockDim * siteX);
+		// Allocate therearranged data
+		rearranged_data.resize( total_rec );
 
-				if( block_id == 0 ) { 
-					std::cout << "Rank " << this_rank << " found block_id=0 at rec_idx = " << rec_idx << " (x,y,z) = (" << x << "," << y << "," << z << ")\n";
-			    }
-				// If we have no block in our map
-				// Insert an empty vector -- NB We should not be in this case. The reason
-				// we have remote data is because this block existed both here and elseere
-				if( local_blocksite_map.find( block_id ) == local_blocksite_map.end() ) {
-					local_blocksite_map.insert( std::pair<uint64_t, std::vector<uint64_t*> >( block_id, std::vector<uint64_t*>()) );
-				}
+		// Now set up receives
+		for(int i=0; i < num_ranks; i++) {
+			MPI_Irecv(&rearranged_data[rdispls[i]], (int)rcounts[i], site_mpi_type, i, i, MPI_COMM_WORLD, &reqs[2*i]);
+		}
 
-				// Push back the site id, and the index in the array
-				std::vector<uint64_t*>& the_vec = local_blocksite_map.at(block_id);
-				the_vec.push_back( remote_data.getPtrToSite(rec_idx));
-			}
-		} // Receiving rank done
-	} // For loop
+		// Now set up the sends
+		for(int i=0; i < num_ranks; i++) { 
+			MPI_Isend(&sites_to_scatter[ displs_to_rank[i] ], (int)sites_to_rank[i], site_mpi_type, i, this_rank, MPI_COMM_WORLD, &reqs[2*i+1]);
+		}
+		std::vector<MPI_Status> statii(2*num_ranks);
+		MPI_Waitall(2*num_ranks, reqs.data(), statii.data());
+ 
+	}
+	sites_to_scatter.clear();
 
-	if( this_rank == 0 ) std::cout << "Remote insertions completed\n";
+	if( this_rank == 0 ) std::cout << "--> Building block map from rearranged data\n";
+	for( const Site& site : rearranged_data ) {
+		uint64_t x=site.x;
+		uint64_t y=site.y;
+		uint64_t z=site.z;
+		uint64_t blockX = x/ blockDim;
+		uint64_t blockY = y/ blockDim;
+		uint64_t blockZ = z/ blockDim;
+		uint64_t siteX = x % blockDim;
+		uint64_t siteY = y % blockDim;
+		uint64_t siteZ = z % blockDim;
+		uint64_t block_id = blockZ + nBlocksZ * (blockY + nBlocksY * blockX);
+		uint64_t site_id = siteZ + blockDim * (siteY + blockDim * siteX);
 
-	local_blockids.resize( local_blocksite_map.size() );
-	auto iterator = local_blockids.begin();
-	for( const auto& kv : local_blocksite_map ) { 
-		*iterator = kv.first; iterator++;
-    }	
+		bool cond1 = (this_rank < num_ranks-1 ) && ( block_id >= minblock_for_rank[this_rank] ) && (block_id < minblock_for_rank[this_rank + 1] );
+		bool cond2 = (this_rank == num_ranks-1) && ( block_id >= minblock_for_rank[this_rank] );
+		if( ! ( cond1 || cond2 ) ) {
+			std::cout << "Error: Block_id out of range: block_id = " << block_id 
+					  << " min_block_for_rank = " << minblock_for_rank[this_rank]
+					  << " max_block_for_rank = " << (( this_rank < num_ranks-1 ) ? minblock_for_rank[this_rank+1] : std::numeric_limits<uint64_t>::max()) <<"\n";
+			MPI_Abort(MPI_COMM_WORLD,-3);
+		}
+	}
 
-	std::cout << "Rank " << this_rank << " :  min_block = " << local_blockids[0] << " max_block = " << local_blockids[ local_blockids.size()-1 ] << "\n";
+	if ( this_rank == 0 ) std::cout << "Rearrangement completed successfully \n";
+	uint64_t my_sites = rearranged_data.size();
+	uint64_t total_sites = 0;
+	MPI_Allreduce(&my_sites, &total_sites, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+	if ( total_sites != rd.global_num_records ) { 
+		std::cout << "Rank " << this_rank << " : Error! Rearranged sites dont sum to original.Rearranged sites=" << total_sites << " original read was: " << rd.global_num_records << "\n";
+		MPI_Abort(MPI_COMM_WORLD, -4);
+	}
+ 	if ( this_rank == 0 ) std::cout << "Correct number of rearranged sites" << std::endl;
 }
 
 
@@ -438,24 +828,23 @@ void processRecordData(const RawData& rd , RawData& remote_data)
 
 int main(int argc, char *argv[]) 
 {
-	if( argc != 2 ) {
-	  std::cout << "Usage: <tester> <fluidsandLinks_file>\n";
+	if( argc != 3 ) {
+	  std::cout << "Usage: linkFileProcessor <fluidsandLinks_file> < SGMY filename>\n";
 	  return -1;
 	}
 	std::string filename_in(argv[1]);
+	std::string filename_out(argv[2]);
 
 	MPI_Init(&argc,&argv);
-
+	MPI_Comm_rank(MPI_COMM_WORLD,&this_rank);
+	MPI_Comm_size(MPI_COMM_WORLD,&num_ranks);
+	if( this_rank == 0) std::cout << "MPI Initialized: I am rank " << this_rank << " out of " << num_ranks << "\n";
 	RawData raw_records(MPI_COMM_WORLD);
-	int this_rank = raw_records.this_rank;
-	int num_ranks = raw_records.num_ranks;
-
 	raw_records.read(filename_in.c_str());
-	if( this_rank == 0) std::cout << "Rank 0: Data read \n" << std::flush;
 
-	RawData remote_records(MPI_COMM_WORLD);
-	processRecordData(raw_records,remote_records);
+	if( this_rank == 0) std::cout << "Data read \n" << std::flush;
+	processRecordData(raw_records);
+	convertData(filename_out);
 
 	MPI_Finalize();
-	
 }
