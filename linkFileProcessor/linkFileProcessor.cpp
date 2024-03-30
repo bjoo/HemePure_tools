@@ -116,22 +116,15 @@ void convertData(const std::string& output_filename)
 
 	// Now we want to set up buffers for output
 	size_t outbuf_idx = 0;
-	
-	// I am not sure I understand this calculation. My calculation would be:
-    //  uint32 - siteIsSimulated 
-    //  uint32 - hasWallNormal 
-    //  3xfloat - for wall normals 
-    //  26* [ uint32_t, uint32, float ] -- 26*[ linkType, configID, wallDistance ]
-	//
-	// so 5 x 32bit + 26 x 3 x 32 bit
-	// If I wanted to pad on a 64 bit boundary I would choose:
-	//  6 x 32bit + 26 x 4 x 32 bit => 4 (32 bit) x [ 6 + 26x4 ] = 440 bytes
-	// 
-	// uint64_t max_site_size = (2 + 26 * 4 * sizeof(uint64_t));
-	uint64_t max_site_size = 440;
+
+	// I don't understand this magic number from mpivx2gmy but 
+	// if I replace it with what I think it should be I seem to have weird problems.
+	//	
+	uint64_t max_site_size = (2 + 26 * 4 * sizeof(uint64_t));
+
 	uint64_t max_buffer_size = blockSites * max_site_size;
 	
-	std::vector<char> outputBuffer( total_output_sites * max_site_size );
+	std::vector<unsigned char> outputBuffer( total_output_sites * max_site_size );
 
 	// Now fill the buffer: Traverse the blocks, get the uncompressedSize
 	for( auto& kv : output_info ) {
@@ -178,7 +171,7 @@ void convertData(const std::string& output_filename)
 					lu_normalY = dir_ldata[4];
 					lu_normalZ = dir_ldata[5];
 
-					newsite.links[linkdir].linkType = (uint32_t) linkType;
+					newsite.links[linkdir].linkType = (uint32_t)linkType;
 					newsite.links[linkdir].configID = (uint32_t) configID;
 
 					wallDistance = (float)(*(reinterpret_cast<double*>(&lu_wallDistance)));
@@ -213,10 +206,11 @@ void convertData(const std::string& output_filename)
 		// First we need to work out the uncompressed block length
 
 		// compression and decompression buffers:
-		std::vector<char> decompressedBuffer(max_buffer_size);
-		std::vector<char> compressedBuffer(max_buffer_size);
+		std::vector<unsigned char> decompressedBuffer(max_buffer_size);
+		std::vector<unsigned char> compressedBuffer(max_buffer_size);
 
 		uint32_t blockUncompressedLen = 0;
+
 		for( int i=0; i < blockSites; i++) { 
 			OutputSite* siteptr = conv_sites[i]; 
 			if( siteptr == nullptr ) { // if solid 
@@ -226,27 +220,30 @@ void convertData(const std::string& output_filename)
 				blockUncompressedLen += sizeof(uint32_t); // SiteIsSimulated
 				for(uint32_t m = 0; m < 26; m++) {
 					blockUncompressedLen += sizeof(uint32_t); // linkType
-					uint32_t linkType = siteptr->links[m].linkType;
-					switch (linkType) {
+					uint32_t linkType = (*siteptr).links[m].linkType;
+
+					switch ( linkType ) {
 						case 0: // linkType = FLUID (no further data)
 							break;
 						case 1: // linkType = WALL (write distance to nearest obstacle)
 							blockUncompressedLen += sizeof(float); // wallDistance
 							break;
 						case 2:
+							blockUncompressedLen += sizeof(uint32_t); // configEntry
+							blockUncompressedLen += sizeof(float); // wallDistance
+							break;
 						case 3: // linkType = INLET or OUTLET (write config ID and distance to nearest obstacle)
 							blockUncompressedLen += sizeof(uint32_t); // configEntry
 							blockUncompressedLen += sizeof(float); // wallDistance
 							break;
 						default:
-							fprintf(stderr, "ERROR: Unrecognised linkType %u.\n", linkType);
+							fprintf(stderr, "ERROR: Unrecognised linkType %u on line %d\n", linkType, __LINE__);
 							MPI_Finalize();
 							exit(1);
 					}
 				}
-				uint32_t hasWallNormal = (siteptr->hasWallNormal == true);
 				blockUncompressedLen += sizeof(uint32_t); // hasWallNormal
-				if (hasWallNormal == 1) {
+				if ( siteptr->hasWallNormal ) {
 					blockUncompressedLen += sizeof(float); // normalX
 					blockUncompressedLen += sizeof(float); // normalY
 					blockUncompressedLen += sizeof(float); // normalZ
@@ -254,6 +251,11 @@ void convertData(const std::string& output_filename)
 			}
 		}
 		
+		if( blockUncompressedLen > max_buffer_size ) { 
+			std::cout << "Rank " << this_rank << " : blockUncompressedLen= " << blockUncompressedLen  << " < max_buffer_size = " 
+			<< max_buffer_size <<"\n";
+		}
+
 		binfo.header.uncompressedBytes = blockUncompressedLen;
 
 		XDR xdrbs;
@@ -270,7 +272,7 @@ void convertData(const std::string& output_filename)
 			for( uint32_t link=0; link < 26; link++) {
 
 				// write type of link
-				uint32_t linkType = siteptr->links[link].linkType;
+				uint32_t linkType = (*siteptr).links[link].linkType;
 				xdr_u_int(&xdrbs, &linkType);
 				switch (linkType) {
 					case 0: // linkType = FLUID (no further data)
@@ -287,7 +289,7 @@ void convertData(const std::string& output_filename)
 						xdr_float(&xdrbs, &(siteptr->links[link].wallDistance));
 						break;
 					default:
-						fprintf(stderr, "ERROR: Unrecognised linkType %u.\n", linkType);
+						fprintf(stderr, "ERROR: Unrecognised linkType %u on line %d .\n", linkType, __LINE__);
 						MPI_Finalize();
 						exit(1);
 				}
@@ -315,11 +317,11 @@ void convertData(const std::string& output_filename)
 
 		// input
 		strm.avail_in = blockUncompressedLen;
-		strm.next_in = (Bytef *)decompressedBuffer.data();
+		strm.next_in = decompressedBuffer.data();
 
 		// output
 		strm.avail_out = max_buffer_size;
-		strm.next_out =(Bytef *)compressedBuffer.data();
+		strm.next_out =compressedBuffer.data();
 
 		uint32_t ret;
 		ret = deflateInit(&strm, Z_BEST_COMPRESSION);
@@ -342,7 +344,7 @@ void convertData(const std::string& output_filename)
 		}
 
 		// get new compressed size
-		uint32_t blockCompressedLen = (unsigned char*)strm.next_out - (unsigned char*)compressedBuffer.data();
+		uint32_t blockCompressedLen = (unsigned char*)strm.next_out - compressedBuffer.data();
 		binfo.header.bytes = blockCompressedLen;
 		memcpy(&outputBuffer[outbuf_idx], compressedBuffer.data(), blockCompressedLen);
 		outbuf_idx += blockCompressedLen;
@@ -366,26 +368,36 @@ void convertData(const std::string& output_filename)
 	// At this point we can get a total file size for the data portion.
 	MPI_Allreduce( &rank_compressed_bytes, &total_compressed_bytes, 1, MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
 
+
 	// We can also get the offsets of the data (from the end of the headers) for each rank by performaing an exclusive prefix scan.
 	MPI_Exscan(&rank_compressed_bytes, &compressed_offset, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
 
 	// To fill out the header info we need the maximum compressed and uncompressed bytes as well as total number of non-empty blocks
 	// We may have these already but they are easy to find by traversing out map.
-	uint32_t global_max_uncompressed_bytes=0;
-	uint32_t global_max_compressed_bytes=0;
+	uint32_t global_max_uncompressed_bytes = 0;
+	uint32_t global_max_compressed_bytes = 0;
+	uint64_t global_uncompressed_bytes = 0;
+	uint64_t global_compressed_bytes = 0;
 	{
 		// We can compute the maxes of both the uncompressed and copressed in a single loop
 		// then we can do a length 2 MPI Allreduce 
-		uint32_t local_maxes[2] ={0, 0};
+		uint32_t local_maxes[2] = { 0, 0 };
+		uint64_t local_bytes[2] = { 0, 0 };
 		for( const auto& kv : output_info ) {
 			const auto& header = kv.second.header;
+			local_bytes[0] += (uint64_t)(header.bytes);
+			local_bytes[1] += (uint64_t)(header.uncompressedBytes);
 			if( header.bytes > local_maxes[0] ) local_maxes[0] = header.bytes;
 			if( header.uncompressedBytes > local_maxes[1] ) local_maxes[1] = header.uncompressedBytes;
 		} 
 		uint32_t global_maxes[2] = {0,0}; 
+		uint64_t global_bytes[2] = {(uint64_t)0,(uint64_t)0};
 		MPI_Allreduce(local_maxes, global_maxes, 2, MPI_UINT32_T, MPI_MAX, MPI_COMM_WORLD);
 		global_max_compressed_bytes = global_maxes[0];
 		global_max_uncompressed_bytes = global_maxes[1];
+		MPI_Allreduce(local_bytes, global_bytes, 2, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+	    global_compressed_bytes = global_bytes[0];
+		global_uncompressed_bytes = global_bytes[1];
 	}
 
 	// The number of non empy blocks localy is just the number of elements in output info
@@ -397,6 +409,19 @@ void convertData(const std::string& output_filename)
 
 	if ( this_rank == 0 ) { 
 		std::cout << "Global Nonempty Blocks = " << global_nonempty_blocks << "\n";
+		std::cout << "Total Uncompressed bytes = " << global_uncompressed_bytes << " = "
+				  << (double)global_uncompressed_bytes/(double)(1024*1024) << " MiB\n";
+
+		std::cout << "Total Compressed bytes = " << total_compressed_bytes << " = "
+				  << (double)total_compressed_bytes/(double)(1024*1024) << " MiB\n"; 
+		std::cout << "Total Compressed bytes 2 = " << global_compressed_bytes << " = "
+				  << (double)global_compressed_bytes/(double)(1024*1024) << " MiB\n";
+		std::cout << "Max Uncomressed bytes (per block) = " << global_max_uncompressed_bytes << " = " 
+				  << (double)global_max_uncompressed_bytes / (double)(1024) << " KiB\n";
+
+		std::cout << "Max Compressed bytes (per block) = " << global_max_compressed_bytes << " = " 
+				  << (double)global_max_compressed_bytes / (double)(1024) << " KiB\n";
+
 		std::cout << "Preparing Preamble and headers\n";
 	}
 
@@ -417,8 +442,10 @@ void convertData(const std::string& output_filename)
 	// This is the offset to the data: HeaderOffset is fixed at 56. NonemptyHeaderRecordSize is 28. 
 	// NB: the sizeof(NonEmptyHeaderRecord) comes to 32 because of 8 byte alignment. so we use the byte count of 28 rather than sizeof()
 	pinfo.DataOffset = pinfo.HeaderOffset + pinfo.NonEmptyBlocks*NonemptyHeaderRecordSize;
-
-	
+	if( this_rank == 0 ) { 
+		std::cout << "Header Size = " << pinfo.NonEmptyBlocks*NonemptyHeaderRecordSize << " bytes = " 
+				   << (double)pinfo.NonEmptyBlocks*NonemptyHeaderRecordSize/(double)(1024*1024) << " MiB\n";
+	}	
 	// Now the headers
 	// We walk the map and unroll it into a vector for writing
 	std::vector<NonEmptyHeaderRecord> local_header( output_info.size() );
@@ -445,10 +472,11 @@ void convertData(const std::string& output_filename)
 	
 	// Now we will make an MPI type for our header: 5 elements (blocks): 2 uint64_ts, 3 uint32_ts
 	MPI_Datatype header_type;
-	int blen[5] = {1,1,1,1,1};  // Number of elements in each 'block'
-	MPI_Aint  bdisp[5] = {0,8,16,20,24}; // Displacements of the elements
-	MPI_Datatype btypes[5] = { MPI_UINT64_T, MPI_UINT64_T, MPI_UINT32_T, MPI_UINT32_T, MPI_UINT32_T };
-	MPI_Type_struct( 5, blen, bdisp, btypes, &header_type );
+	int blen[6] = {1,1,1,1,1};  // Number of elements in each 'block'
+	MPI_Aint  bdisp[6] = {0,8,16,20,24,28}; // Displacements of the elements
+
+	MPI_Datatype btypes[6] = { MPI_UINT64_T, MPI_UINT64_T, MPI_UINT32_T, MPI_UINT32_T, MPI_UINT32_T, MPI_UINT32_T };
+	MPI_Type_struct( 6, blen, bdisp, btypes, &header_type );
 	MPI_Type_commit(&header_type);
 
 	size_t chunk_size = 2*1024*1024; // 2 MiB transaction size

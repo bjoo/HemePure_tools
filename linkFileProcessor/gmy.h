@@ -15,10 +15,14 @@ struct NonEmptyHeaderRecord {
   uint64_t   fileOffset;   // 8 bytes
   uint32_t sites;          // 4 bytes
   uint32_t bytes;           // 4 bytes
-  uint32_t uncompressedBytes; // 4 bytes  Total 28 bytes
+  uint32_t uncompressedBytes; // 4 bytes
+  uint32_t weights;			  // 4 bytes  Total 32 bytes  
+  NonEmptyHeaderRecord() : blockNumber(0), fileOffset(0),
+						   sites(0), bytes(0), uncompressedBytes(0),
+						   weights(0) { }
 };
 
-constexpr size_t NonemptyHeaderRecordSize = 28;
+constexpr size_t NonemptyHeaderRecordSize = 32;
 
 struct OutputPreambleInfo {
   uint32_t HemeLBMagic;
