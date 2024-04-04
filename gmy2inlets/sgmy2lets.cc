@@ -9,9 +9,15 @@
 #define DEBUGMSG(...) printf(__VA_ARGS__)
 #else
 #define DEBUGMSG(...)
+#define INFOMSG(...) printf(__VA_ARGS__)
 #endif
 
 using namespace std;
+
+constexpr uint32_t HemeLbMagicNumber = 0x686c6221;
+constexpr uint32_t GmyNativeMagicNumber = 0x676d7905;
+constexpr uint32_t GmyNativeVersionNumber = 1;
+constexpr size_t NonemptyHeaderRecordSize = 32;
 
 struct NonEmptyHeaderRecord {
   uint64_t   blockNumber;  // 8 bytes
@@ -25,7 +31,38 @@ struct NonEmptyHeaderRecord {
 						   weights(0) { }
 };
 
-constexpr size_t NonemptyHeaderRecordSize = 32;
+
+
+
+struct OutputPreambleInfo {
+  uint32_t HemeLBMagic;
+  uint32_t GmyNativeMagic;
+
+  uint32_t Version;
+  uint32_t BlocksX;
+
+  uint32_t BlocksY;
+  uint32_t BlocksZ;
+
+  uint32_t BlockSize;
+  uint32_t MaxCompressedBytes;
+
+  uint32_t MaxUncompressedBytes;
+  uint32_t HeaderOffset;
+
+  uint64_t NonEmptyBlocks;
+  uint64_t DataOffset;
+  OutputPreambleInfo() : HemeLBMagic(HemeLbMagicNumber),
+                         GmyNativeMagic(GmyNativeMagicNumber),
+                         Version(GmyNativeVersionNumber),
+                         BlocksX(0), BlocksY(0), BlocksZ(0),
+                         MaxCompressedBytes(0), MaxUncompressedBytes(0),
+                         HeaderOffset(56),
+                         NonEmptyBlocks(0),
+                         DataOffset(0) {}
+
+};
+
 
 int64_t xyz_to_i(uint32_t x, uint32_t y, uint32_t z, uint32_t maxX, uint32_t maxY,  uint32_t maxZ)
 {
@@ -60,8 +97,6 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
   // gmy file handle
   FILE *sgmyFile;
   
-  // xdr stdio stream
-  XDR xdrs;
   // xdr block data / memory stream
   XDR xdrbs;
 
@@ -71,18 +106,13 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
   uint32_t ret;
 
   // Declarations for the header information
-  uint32_t hlbMagic;
-  uint32_t sgmyMagic;
-  uint32_t sgmyVersion;
   uint32_t xBlockCount;
   uint32_t yBlockCount;
   uint32_t zBlockCount;
   uint32_t blockEdgeLen;
   uint32_t maxCompressedBytes;
   uint32_t maxUncompressedBytes;
-  uint32_t headerOffset;
   uint64_t nonEmptyBlocks; 
-  uint64_t dataOffset;
 
   // Data calculated from header information
   // uint32_t totalBlockCount -- we won't need this it is
@@ -116,8 +146,6 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
 
   // Allocations to XDR_DECODE from file stream
   sgmyFile = fopen(fname_sgmy, "r");
-  xdrstdio_create(&xdrs, sgmyFile, XDR_DECODE);
-  i = 0;
 
   // Open output inlets file
   FILE *outfile = NULL;
@@ -131,32 +159,27 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
   strm.zfree = Z_NULL;
   strm.opaque = Z_NULL;
 
-  // Reading gmy header information
-  xdr_u_int(&xdrs, &hlbMagic);
-  xdr_u_int(&xdrs, &sgmyMagic);
-  xdr_u_int(&xdrs, &sgmyVersion);
-  xdr_u_int(&xdrs, &xBlockCount);
-  xdr_u_int(&xdrs, &yBlockCount);
-  xdr_u_int(&xdrs, &zBlockCount);
-  xdr_u_int(&xdrs, &blockEdgeLen);
-  xdr_u_int(&xdrs, &maxCompressedBytes);
-  xdr_u_int(&xdrs, &maxUncompressedBytes);
-  xdr_u_int(&xdrs, &headerOffset);
-  xdr_u_long(&xdrs, &nonEmptyBlocks);
-  xdr_u_long(&xdrs, &dataOffset);
+  OutputPreambleInfo preamble;
+  ret = fread(&preamble, preamble.HeaderOffset, 1, sgmyFile);
+  xBlockCount = preamble.BlocksX;
+  yBlockCount = preamble.BlocksY;
+  zBlockCount = preamble.BlocksZ;
+  blockEdgeLen = preamble.BlockSize;
+  maxCompressedBytes = preamble.MaxCompressedBytes;
+  maxUncompressedBytes = preamble.MaxUncompressedBytes;
+  nonEmptyBlocks = preamble.NonEmptyBlocks;
 
-  DEBUGMSG("hlbMagic = %u\n", hlbMagic);
-  DEBUGMSG("sgmyMagic = %u\n", sgmyMagic);
-  DEBUGMSG("sgmyVersion = %u\n", sgmyVersion);
-  DEBUGMSG("xBlockCount = %u\n", xBlockCount);
-  DEBUGMSG("yBlockCount = %u\n", yBlockCount);
-  DEBUGMSG("zBlockCount = %u\n", zBlockCount);
-  DEBUGMSG("blockEdgeLen = %u\n", blockEdgeLen);
-  DEBUGMSG("maxCompressedBytes = %u\n", maxCompressedBytes);
-  DEBUGMSG("maxUncompressedBytes = %u\n", maxUncompressedBytes);
-  DEBUGMSG("headerOffset = %u\n", headerOffset);
-  DEBUGMSG("nonEmptyBlocks = %lu\n", nonEmptyBlocks);
-  DEBUGMSG("dataOffset = %lu\n", dataOffset);
+  // Reading gmy header information
+  DEBUGMSG("hlbMagic = %u\n", preamble.HemeLBMagic);
+  DEBUGMSG("sgmyMagic = %u\n", preamble.GmyNativeMagic);
+  DEBUGMSG("sgmyVersion = %u\n", preamble.Version);
+  INFOMSG("xBlockCount = %u\n", xBlockCount);
+  INFOMSG("yBlockCount = %u\n", yBlockCount);
+  INFOMSG("zBlockCount = %u\n", zBlockCount);
+  INFOMSG("blockEdgeLen = %u\n", blockEdgeLen);
+  INFOMSG("maxCompressedBytes = %u\n", maxCompressedBytes);
+  INFOMSG("maxUncompressedBytes = %u\n", maxUncompressedBytes);
+  INFOMSG("nonEmptyBlocks = %lu\n", nonEmptyBlocks);
 
   // Calculating the number of blocks filling the complete volume
   // totalBlockCount = xBlockCount * yBlockCount * zBlockCount;
@@ -173,17 +196,11 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
   // Reading block header information to arrays
   uint64_t num_inlets_found = 0;
   uint64_t num_entries = 0;
+  i=0;
   while (i<nonEmptyBlocks) {
 
+    ret = fread(&headerInfo[i], NonemptyHeaderRecordSize, 1, sgmyFile);
     auto& currBlock = headerInfo[i];
-    // Number of sites actually stored for the block
-    xdr_u_long(&xdrs, &(currBlock.blockNumber));
-    xdr_u_long(&xdrs, &(currBlock.fileOffset));
-    xdr_u_int(&xdrs, &(currBlock.sites));
-    xdr_u_int(&xdrs, &(currBlock.bytes));   
-    xdr_u_int(&xdrs, &(currBlock.uncompressedBytes));
-    xdr_u_int(&xdrs, &(currBlock.weights));
-
     
     DEBUGMSG("Block[%lu] ID: %lu\n", i, currBlock.blockNumber);
     DEBUGMSG("blockSiteCount = %u\n", currBlock.sites);
@@ -221,12 +238,14 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
     
 
     // Read compressed block from the file
+	fseek(sgmyFile, preamble.DataOffset + currBlock.fileOffset, SEEK_SET);
+
     ret = fread(compressedBuffer.data(), currBlock.bytes, 1, sgmyFile);
 
     // Initialise zlib and check if it is OK
     ret = inflateInit(&strm);
     if (ret != Z_OK)
-        printf("Decompression init error for block\n"); 
+        printf("Decompression init error for block %lu\n",i); 
 
     // Specify number of bytes to decompress (inflate in zlib-speech)
     strm.avail_in = currBlock.bytes;
@@ -244,12 +263,12 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
     // Run zlib decompression and check if it is OK
     ret = inflate(&strm, Z_FINISH);
     if (ret != Z_STREAM_END)
-        printf("Decompression error for block\n");
+        printf("Decompression error for block %lu\n",i);
 
     // Finalise/end zlib decompression and check if it is OK
     ret = inflateEnd(&strm);
     if (ret != Z_OK)
-        printf("Decompression end error for block\n");
+        printf("Decompression end error for block %lu\n",i);
           
     // Create a new XDR_DECODE stream on decompressed buffer
     xdrmem_create(&xdrbs, (char *)decompressedBuffer.data(), 
@@ -262,7 +281,7 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
     localZ = 0;
 
     for (site = 0;site < maxSitesPerBlock; site++) {
-        DEBUGMSG("local site index (on block): %u\n", site);
+        DEBUGMSG("local site index (on block): %lu\n", site);
         // Check if inside or outside (aka solid) of the simulation domain
         xdr_u_int(&xdrbs, &siteIsSimulated);
         DEBUGMSG("siteIsSimulated=%u\n", siteIsSimulated);
@@ -458,8 +477,6 @@ int sgmy2lets(char *fname_sgmy, char *fname_inlets, bool find_inlets)
 
   // free(blockDataOffset);
 
-  // Destroy the XDR_DECODE stream on the gmy file
-  xdr_destroy(&xdrs);
 
   // Close the gmy file handle
   fclose(sgmyFile);
