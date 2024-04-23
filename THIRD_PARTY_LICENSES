@@ -1,0 +1,16 @@
+Third Party Copyright and Licensing
+===================================
+
+In addition to the LICENSE file, the following attributions are made to 3rd
+party developers. These notices must be included in any redistribution or derived
+work of this package in either source code or binary form. Other than the requirement
+to disribute this file, as described above, the terms in the LICENSE file are unchanged.
+
+
+Attribution: Copyright 2024 NVIDIA Corporation
+============
+Contributions to: 
+    - linkFileProcessor directory and files therein
+    - gmy2inlets directory an files therein
+    - modifications to hemeLBpreprocSingle.py (resulting in hemeLBpreprocSingleNewTools.py)
+

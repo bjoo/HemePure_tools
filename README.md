@@ -1,4 +1,7 @@
 # HemePure_tools
+
+- This package is distributed unter a 3-part BSD License. Please see the files LICENSE and THIRD_PARTY_LICENSES for terms and copyright attributions.
+
 - Repository contains tools for HemeLB geometry generation and stuff.
 
 - requires geometry in *.stl format with in/outlets open (think pipe) and inward oriented normals
